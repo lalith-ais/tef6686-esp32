@@ -570,16 +570,24 @@ static esp_err_t tef_init_all(void)
 
     } else {
         ESP_LOGI(TAG, "Chip already booted, skipping patch");
+        // Re-apply op mode and FM mode on warm boot
+        tef_cmd(TEF_APPL, CMD_SET_OP_MODE, 1, 0, 0, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        tef_cmd(TEF_FM, 1, 1, 0, 0, 1);   // FM_Set_Mode
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    // Set de-emphasis 50us (Europe): FM Cmd_Set_Deemphasis, value 500 = 50us
+    // De-emphasis 50us (Europe)
     tef_cmd(TEF_FM, CMD_SET_DEEMPHASIS, 500, 0, 0, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Unmute audio: volume 0dB = 0, mute off
+    // Set volume 0dB then unmute
+    tef_cmd(TEF_AUDIO, CMD_SET_VOLUME, 0, 0, 0, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
     tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    ESP_LOGI(TAG, "Audio: volume=0dB unmuted");
     return ESP_OK;
 }
 
