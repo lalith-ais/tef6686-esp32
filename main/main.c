@@ -70,6 +70,15 @@ static esp_err_t tef_read(uint8_t module, uint8_t index,
                                        100);
 }
 
+// Set crystal reference to 9.216 MHz
+// Must be sent BEFORE APPL_SET_OP_MODE
+static esp_err_t tef_set_crystal(void)
+{
+    uint8_t buf[] = { 0x09, 0x40, 0x04, 0x01,
+                      0x00, 0x8C, 0xA0, 0x00, 0x00, 0x00 };
+    return i2c_master_transmit(tef_handle, buf, sizeof(buf), 100);
+}
+
 // ---------- TEF6686 initialisation ----------
 
 static esp_err_t tef_init(void)
@@ -78,6 +87,9 @@ static esp_err_t tef_init(void)
 
     // Give the chip a moment after power-on
     vTaskDelay(pdMS_TO_TICKS(100));
+
+	
+	tef_set_crystal();
 
     // APPL_SET_OP_MODE: normal operation (module 0x80, index 0x01, p1=1)
     ret = tef_write(0x80, 0x01, 1, 0, 0);
