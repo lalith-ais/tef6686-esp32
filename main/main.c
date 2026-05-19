@@ -597,7 +597,12 @@ static esp_err_t tef_init_all(void)
 static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 {
     // FM Cmd_Tune_To: p1=mode(4=normal), p2=frequency
-    return tef_cmd(TEF_FM, CMD_TUNE_TO, 4, (int16_t)freq_10khz, 0, 2);
+    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 4, (int16_t)freq_10khz, 0, 2);
+    if (ret != ESP_OK) return ret;
+    // Cmd_Set_RDS(1,1,0) must follow every tune — Radio_SetFreq() does this in
+    // the original source. Without it the demodulator does not fully configure
+    // and USN stays high with offset drifting.
+    return tef_cmd(TEF_FM, 81, 1, 1, 0, 3);   // 81 = Cmd_Set_RDS
 }
 
 // ==========================================================================
