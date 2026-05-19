@@ -364,18 +364,15 @@ static esp_err_t tef_cmd(uint8_t module, uint8_t cmd,
 }
 
 // ==========================================================================
-// TEF read: TWO separate transactions (write-stop, then read-start)
-// The TEF6686 requires a STOP condition between the command write and
-// the data read — it does not support repeated-start for this protocol.
-// Source: Tuner_WriteBuffer() then Tuner_ReadBuffer() are separate calls.
+// TEF read: write [module][cmd][0x01] then read len bytes.
+// Uses repeated-start (transmit_receive) which is what the Arduino Wire
+// library does when beginTransmission/endTransmission(false)/requestFrom
+// is used. The TEF6686 responds with the requested data on the read phase.
 // ==========================================================================
 static esp_err_t tef_read(uint8_t module, uint8_t cmd, uint8_t *out, size_t len)
 {
     uint8_t reg[3] = { module, cmd, 0x01 };
-    esp_err_t ret = i2c_master_transmit(tef_handle, reg, 3, 100);
-    if (ret != ESP_OK) return ret;
-    vTaskDelay(pdMS_TO_TICKS(2));  // small gap between write and read
-    return i2c_master_receive(tef_handle, out, len, 100);
+    return i2c_master_transmit_receive(tef_handle, reg, 3, out, len, 100);
 }
 
 // ==========================================================================
@@ -526,56 +523,47 @@ static esp_err_t tef_radio_init(void)
 // ==========================================================================
 // Boot status check
 // ==========================================================================
-static esp_err_t tef_get_boot_status(uint8_t *status)
+static uint8_t tef_get_boot_status(void)
 {
     uint8_t buf[2] = {0};
-    // Read APPL Get_Operation_Status
     esp_err_t ret = tef_read(TEF_APPL, CMD_GET_OP_STATUS, buf, 2);
-    if (ret == ESP_OK)
-        *status = (buf[0] << 8 | buf[1]) & 0xFF;
-    return ret;
+    if (ret != ESP_OK) return 0;
+    return (buf[0] << 8 | buf[1]) & 0xFF;
 }
 
 // ==========================================================================
-// Top-level init
+// Top-level init — always runs full sequence
+// The boot status check is informational only. We cannot rely on it to skip
+// patch upload because the TEF module may have lost power while the ESP32
+// retained power (e.g. USB replug without ESP32 reset). Always re-init.
 // ==========================================================================
 static esp_err_t tef_init_all(void)
 {
     esp_err_t ret;
-    uint8_t bootstatus = 0;
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = tef_get_boot_status(&bootstatus);
+    uint8_t bootstatus = tef_get_boot_status();
     ESP_LOGI(TAG, "Boot status: 0x%02X", bootstatus);
 
-    if (bootstatus == 0) {
-        // Chip needs patch + crystal init + power on
-        ret = tef_upload_patch();
-        if (ret != ESP_OK) { ESP_LOGE(TAG, "Patch upload failed"); return ret; }
+    // Always upload patch and full init sequence.
+    // If chip is already booted this is harmless — it re-initialises cleanly.
+    ret = tef_upload_patch();
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Patch upload failed"); return ret; }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-        ret = tef_crystal_init_9216();
-        if (ret != ESP_OK) { ESP_LOGE(TAG, "Crystal init failed"); return ret; }
+    ret = tef_crystal_init_9216();
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Crystal init failed"); return ret; }
 
-        // APPL_Set_OperationMode(1) = power on
-        ret = tef_cmd(TEF_APPL, CMD_SET_OP_MODE, 1, 0, 0, 1);
-        if (ret != ESP_OK) return ret;
-        vTaskDelay(pdMS_TO_TICKS(200));
+    // APPL_Set_OperationMode(1) = normal operation
+    ret = tef_cmd(TEF_APPL, CMD_SET_OP_MODE, 1, 0, 0, 1);
+    if (ret != ESP_OK) return ret;
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-        // Full radio init table
-        ret = tef_radio_init();
-        if (ret != ESP_OK) { ESP_LOGE(TAG, "Radio init failed"); return ret; }
-
-    } else {
-        ESP_LOGI(TAG, "Chip already booted, skipping patch");
-        // Re-apply op mode and FM mode on warm boot
-        tef_cmd(TEF_APPL, CMD_SET_OP_MODE, 1, 0, 0, 1);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        tef_cmd(TEF_FM, 1, 1, 0, 0, 1);   // FM_Set_Mode
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+    // Full radio init table
+    ret = tef_radio_init();
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "Radio init failed"); return ret; }
 
     // De-emphasis 50us (Europe)
     tef_cmd(TEF_FM, CMD_SET_DEEMPHASIS, 500, 0, 0, 1);
@@ -612,14 +600,15 @@ static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 // ==========================================================================
 static void tef_print_quality(uint16_t freq)
 {
+    // 12 bytes: [2 level][2 usn][2 wam][2 offset][2 bw][2 mod]
+    // After proper cold boot with patch upload, data starts at buf[0].
     uint8_t buf[12] = {0};
-    esp_err_t ret = tef_read(TEF_FM, CMD_GET_QUALITY_STATUS, buf, 14);
+    esp_err_t ret = tef_read(TEF_FM, CMD_GET_QUALITY_STATUS, buf, 12);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Quality read failed: %s", esp_err_to_name(ret));
         return;
     }
 
-    // level, usn, wam, offset, bandwidth, modulation (2 bytes each)
     int16_t rssi      = (int16_t)((buf[0] << 8) | buf[1]);
     int16_t usn       = (int16_t)((buf[2] << 8) | buf[3]);
     int16_t wam       = (int16_t)((buf[4] << 8) | buf[5]);
@@ -666,11 +655,14 @@ static void input_task(void *arg)
             int f = atoi(line);
             if (f >= 6400 && f <= 10800) {
                 current_freq = (uint16_t)f;
-                if (tef_tune_fm(current_freq) == ESP_OK)
+                if (tef_tune_fm(current_freq) == ESP_OK) {
                     printf(">> Tuned to %d.%02d MHz\n",
                            current_freq/100, current_freq%100);
-                else
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);
+                } else {
                     printf(">> Tune failed\n");
+                }
                 vTaskDelay(pdMS_TO_TICKS(400));
             } else if (strlen(line) > 0) {
                 printf(">> Invalid: '%s' (use 6400-10800)\n", line);
@@ -720,6 +712,10 @@ void app_main(void)
     ESP_ERROR_CHECK(tef_tune_fm(current_freq));
     ESP_LOGI(TAG, "Tuned to %d.%02d MHz", current_freq/100, current_freq%100);
     vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Ensure audio is unmuted after tune (tune can re-mute the output)
+    tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);
+    ESP_LOGI(TAG, "Audio unmuted after tune");
 
     xTaskCreate(quality_task, "quality", 4096, NULL, 5, NULL);
     xTaskCreate(input_task,   "input",   4096, NULL, 4, NULL);
