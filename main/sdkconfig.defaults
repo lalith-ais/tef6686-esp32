@@ -1,0 +1,8 @@
+# Serial monitor baud rate
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Use the new I2C master driver (IDF v5.x)
+CONFIG_I2C_ENABLE_DEBUG_LOG=n
+
+# Optional: increase log level for our tag during development
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
