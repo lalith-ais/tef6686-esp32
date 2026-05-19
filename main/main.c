@@ -614,12 +614,7 @@ static void tef_print_quality(uint16_t freq)
         return;
     }
 
-    // Dump raw bytes for diagnosis
-    printf("RAW[12]: ");
-    for (int i = 0; i < 12; i++) printf("%02X ", buf[i]);
-    printf("\n");
-
-    // Try offset 0 first
+    // level, usn, wam, offset, bandwidth, modulation (2 bytes each)
     int16_t rssi      = (int16_t)((buf[0] << 8) | buf[1]);
     int16_t usn       = (int16_t)((buf[2] << 8) | buf[3]);
     int16_t wam       = (int16_t)((buf[4] << 8) | buf[5]);
