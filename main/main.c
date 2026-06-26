@@ -364,15 +364,18 @@ static esp_err_t tef_cmd(uint8_t module, uint8_t cmd,
 }
 
 // ==========================================================================
-// TEF read: write [module][cmd][0x01] then read len bytes.
-// Uses repeated-start (transmit_receive) which is what the Arduino Wire
-// library does when beginTransmission/endTransmission(false)/requestFrom
-// is used. The TEF6686 responds with the requested data on the read phase.
+// TEF read: STOP-then-START (two separate transactions).
+// The Arduino Wire library uses endTransmission(true) = STOP, then
+// requestFrom() = new START. The TEF6686 requires this — repeated-start
+// causes it to echo the command bytes back instead of returning data.
 // ==========================================================================
 static esp_err_t tef_read(uint8_t module, uint8_t cmd, uint8_t *out, size_t len)
 {
     uint8_t reg[3] = { module, cmd, 0x01 };
-    return i2c_master_transmit_receive(tef_handle, reg, 3, out, len, 100);
+    esp_err_t ret = i2c_master_transmit(tef_handle, reg, 3, 100);
+    if (ret != ESP_OK) return ret;
+    vTaskDelay(pdMS_TO_TICKS(3));
+    return i2c_master_receive(tef_handle, out, len, 100);
 }
 
 // ==========================================================================
@@ -584,13 +587,14 @@ static esp_err_t tef_init_all(void)
 // ==========================================================================
 static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 {
-    // FM Cmd_Tune_To: p1=mode(4=normal), p2=frequency
-    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 4, (int16_t)freq_10khz, 0, 2);
+    // FM Cmd_Tune_To: p1=1 (normal tune with auto-mute/unmute), p2=frequency
+    // Mode 1 = tune with auto stereo detection (source uses mode 4 = preset)
+    // We use mode 1 which matches devTEF_Radio_Tune_To() in the source
+    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 1, (int16_t)freq_10khz, 0, 2);
     if (ret != ESP_OK) return ret;
-    // Cmd_Set_RDS(1,1,0) must follow every tune — Radio_SetFreq() does this in
-    // the original source. Without it the demodulator does not fully configure
-    // and USN stays high with offset drifting.
-    return tef_cmd(TEF_FM, 81, 1, 1, 0, 3);   // 81 = Cmd_Set_RDS
+    vTaskDelay(pdMS_TO_TICKS(50));   // let PLL lock before RDS
+    // Cmd_Set_RDS(1,1,0) — must follow every tune per Radio_SetFreq() source
+    return tef_cmd(TEF_FM, 81, 1, 1, 0, 3);
 }
 
 // ==========================================================================
@@ -711,10 +715,12 @@ void app_main(void)
     // Tune to default frequency
     ESP_ERROR_CHECK(tef_tune_fm(current_freq));
     ESP_LOGI(TAG, "Tuned to %d.%02d MHz", current_freq/100, current_freq%100);
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(1000));  // wait for PLL lock and stereo detection
 
-    // Ensure audio is unmuted after tune (tune can re-mute the output)
-    tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);
+    // Unmute — tune temporarily mutes audio while PLL locks
+    tef_cmd(TEF_AUDIO, CMD_SET_VOLUME, 0, 0, 0, 1);  // 0dB
+    vTaskDelay(pdMS_TO_TICKS(10));
+    tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);    // unmute
     ESP_LOGI(TAG, "Audio unmuted after tune");
 
     xTaskCreate(quality_task, "quality", 4096, NULL, 5, NULL);
