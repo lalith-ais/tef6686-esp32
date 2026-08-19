@@ -613,11 +613,11 @@ static void tef_print_quality(uint16_t freq)
         return;
     }
 
-    int16_t rssi      = (int16_t)((buf[0] << 8) | buf[1]);
-    int16_t usn       = (int16_t)((buf[2] << 8) | buf[3]);
-    int16_t wam       = (int16_t)((buf[4] << 8) | buf[5]);
-    int16_t offset    = (int16_t)((buf[6] << 8) | buf[7]);
-    uint16_t bw       =          ((buf[8] << 8) | buf[9]) / 10;
+int16_t rssi = (int16_t)((buf[2] << 8) | buf[3]);  // was buf[0], buf[1]
+int16_t usn  = (int16_t)((buf[4] << 8) | buf[5]);  // shift everything down
+int16_t wam  = (int16_t)((buf[6] << 8) | buf[7]);
+int16_t offset = (int16_t)((buf[8] << 8) | buf[9]);
+uint16_t bw  =           ((buf[10] << 8) | buf[11]) / 10;
 
     // Stereo status
     uint8_t sbuf[2] = {0};
@@ -636,7 +636,7 @@ static void tef_print_quality(uint16_t freq)
 // ==========================================================================
 // Tasks
 // ==========================================================================
-static uint16_t current_freq = 10660;   // 106.60 MHz
+static uint16_t current_freq = 9000;   // 106.60 MHz
 
 static void quality_task(void *arg)
 {
