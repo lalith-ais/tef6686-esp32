@@ -11,8 +11,8 @@
  *  - Quality read uses correct 14-byte response with 2-byte prefix skip
  *
  * Wiring:
- *   TEF6686 SDA  -> GPIO 21
- *   TEF6686 SCL  -> GPIO 22
+ *   TEF6686 SDA  -> GPIO 18 
+ *   TEF6686 SCL  -> GPIO 17
  *   TEF6686 VCC  -> 5V rail
  *   TEF6686 GND  -> GND (common with ESP32)
  *
@@ -32,8 +32,8 @@ static const char *TAG = "TEF6686";
 
 // ---------- Pin / bus config ----------
 #define I2C_PORT        I2C_NUM_0
-#define I2C_SDA_PIN     21
-#define I2C_SCL_PIN     22
+#define I2C_SDA_PIN     18
+#define I2C_SCL_PIN     17
 #define I2C_SPEED_HZ    100000
 #define TEF_I2C_ADDR    0x64
 
