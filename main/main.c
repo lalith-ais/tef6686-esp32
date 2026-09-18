@@ -1,6 +1,6 @@
 /*
- * TEF6686 Minimal Hardware Test  -- v3
- * ESP-IDF v5.x  |  F8605 chip  |  9.216 MHz crystal
+ * TEF6686 Minimal Hardware Test  -- v3.1
+ * ESP-IDF v5.x  |  F8605 chip  |  12.000 MHz crystal
  *
  * Key fixes vs v2:
  *  - Correct I2C command format: [module][cmd][0x01][p1_hi][p1_lo]...
@@ -444,9 +444,9 @@ static esp_err_t tef_upload_patch(void)
 }
 
 // ==========================================================================
-// Crystal init for 9.216 MHz (tuner_init_tab9216 from source)
+// Crystal init for 12.000 MHz (tuner_init_tab12000 from source)
 // ==========================================================================
-static esp_err_t tef_crystal_init_9216(void)
+static esp_err_t tef_crystal_init_12000(void)
 {
     esp_err_t ret;
 
@@ -458,7 +458,7 @@ static esp_err_t tef_crystal_init_9216(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // Entry 2: [9 bytes] 0x40 0x04 0x01 0x00 0xB7 0x1B 0x00 0x00 0x00
-    // APPL_Set_ReferenceClock for 12.000 MHz (type=0x0000 = crystal oscillator)
+    // APPL_Set_ReferenceClock: 0x00B71B00 = 12,000,000 Hz (type 0x0000 = crystal)
     uint8_t clk[] = { 0x40, 0x04, 0x01, 0x00, 0xB7, 0x1B, 0x00, 0x00, 0x00 };
     ret = raw_write(clk, sizeof(clk));
     if (ret != ESP_OK) return ret;
@@ -526,12 +526,12 @@ static esp_err_t tef_radio_init(void)
 // ==========================================================================
 // Boot status check
 // ==========================================================================
-static uint8_t tef_get_boot_status(void)
+static uint16_t tef_get_boot_status(void)
 {
     uint8_t buf[2] = {0};
     esp_err_t ret = tef_read(TEF_APPL, CMD_GET_OP_STATUS, buf, 2);
     if (ret != ESP_OK) return 0;
-    return (buf[0] << 8 | buf[1]) & 0xFF;
+    return (uint16_t)((buf[0] << 8) | buf[1]);  // full status word
 }
 
 // ==========================================================================
@@ -546,8 +546,8 @@ static esp_err_t tef_init_all(void)
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    uint8_t bootstatus = tef_get_boot_status();
-    ESP_LOGI(TAG, "Boot status: 0x%02X", bootstatus);
+    uint16_t bootstatus = tef_get_boot_status();
+    ESP_LOGI(TAG, "Boot status: 0x%04X", bootstatus);
 
     // Always upload patch and full init sequence.
     // If chip is already booted this is harmless — it re-initialises cleanly.
@@ -556,7 +556,7 @@ static esp_err_t tef_init_all(void)
 
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    ret = tef_crystal_init_9216();
+    ret = tef_crystal_init_12000();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "Crystal init failed"); return ret; }
 
     // APPL_Set_OperationMode(0) = normal operation (1 = radio standby, no RF)
@@ -568,8 +568,8 @@ static esp_err_t tef_init_all(void)
     ret = tef_radio_init();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "Radio init failed"); return ret; }
 
-    // De-emphasis 50us (Europe)
-    tef_cmd(TEF_FM, CMD_SET_DEEMPHASIS, 500, 0, 0, 1);
+    // De-emphasis 50us (Europe) -- parameter is time constant in us
+    tef_cmd(TEF_FM, CMD_SET_DEEMPHASIS, 50, 0, 0, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Set volume 0dB then unmute
@@ -587,10 +587,9 @@ static esp_err_t tef_init_all(void)
 // ==========================================================================
 static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 {
-    // FM Cmd_Tune_To: p1=1 (normal tune with auto-mute/unmute), p2=frequency
-    // Mode 1 = tune with auto stereo detection (source uses mode 4 = preset)
-    // We use mode 1 which matches devTEF_Radio_Tune_To() in the source
-    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 1, (int16_t)freq_10khz, 0, 2);
+    // FM Cmd_Tune_To: p1=4 (preset tune), p2=frequency
+    // Matches devTEF_Radio_Tune_To() in Tuner_Drv_Lithio.cpp (mode 4 for FM)
+    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 4, (int16_t)freq_10khz, 0, 2);
     if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(50));   // let PLL lock before RDS
     // Cmd_Set_RDS(1,1,0) — must follow every tune per Radio_SetFreq() source
@@ -604,20 +603,21 @@ static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 // ==========================================================================
 static void tef_print_quality(uint16_t freq)
 {
-    // 12 bytes: [2 level][2 usn][2 wam][2 offset][2 bw][2 mod]
-    // After proper cold boot with patch upload, data starts at buf[0].
-    uint8_t buf[12] = {0};
-    esp_err_t ret = tef_read(TEF_FM, CMD_GET_QUALITY_STATUS, buf, 12);
+    // 14 bytes: [2 status][2 level][2 usn][2 wam][2 offset][2 bw][2 mod]
+    // status word: bit15=busy, bits1:0=boot status (see TEF668x user manual)
+    uint8_t buf[14] = {0};
+    esp_err_t ret = tef_read(TEF_FM, CMD_GET_QUALITY_STATUS, buf, 14);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Quality read failed: %s", esp_err_to_name(ret));
         return;
     }
 
-int16_t rssi = (int16_t)((buf[2] << 8) | buf[3]);  // was buf[0], buf[1]
-int16_t usn  = (int16_t)((buf[4] << 8) | buf[5]);  // shift everything down
-int16_t wam  = (int16_t)((buf[6] << 8) | buf[7]);
-int16_t offset = (int16_t)((buf[8] << 8) | buf[9]);
-uint16_t bw  =           ((buf[10] << 8) | buf[11]) / 10;
+    int16_t rssi = (int16_t)((buf[2] << 8) | buf[3]);
+    int16_t usn  = (int16_t)((buf[4] << 8) | buf[5]);
+    int16_t wam  = (int16_t)((buf[6] << 8) | buf[7]);
+    int16_t offset = (int16_t)((buf[8] << 8) | buf[9]);
+    uint16_t bw  =           ((buf[10] << 8) | buf[11]) / 10;
+    uint16_t mod =           ((buf[12] << 8) | buf[13]) / 10;
 
     // Stereo status — cmd 133 (Get_Signal_Status) returns one 16-bit word:
     // bit 15 = stereo pilot detected, bit 14 = digital signal (TEF6688/6689 only).
@@ -629,21 +629,21 @@ uint16_t bw  =           ((buf[10] << 8) | buf[11]) / 10;
         stereo = ((sbuf[0] << 8 | sbuf[1]) & 0x8000) != 0;  // bit 15 = stereo pilot
 
     printf("[%3d.%02d MHz] RSSI:%+5.1f dBuV | USN:%3d | WAM:%3d | "
-           "Offset:%+5.1f kHz | BW:%3d kHz | %s\n",
+           "Offset:%+5.1f kHz | BW:%3d kHz | MOD:%3d kHz | %s\n",
            freq/100, freq%100,
            rssi/10.0f, usn, wam,
-           offset/10.0f, bw,
+           offset/10.0f, bw, mod,
            stereo ? "STEREO" : "mono");
 }
 
 // ==========================================================================
 // Tasks
 // ==========================================================================
-static uint16_t current_freq = 9000;   // 106.60 MHz
+static uint16_t current_freq = 9000;   // 90.00 MHz
 
 static void quality_task(void *arg)
 {
-    printf("\n=== TEF6686 Test v3 (F8605 + 9.216MHz + V102 patch) ===\n");
+    printf("\n=== TEF6686 Test v3.1 (F8605 + 12.000MHz + V102 patch) ===\n");
     printf("Type frequency in 10kHz units + Enter to retune.\n");
     printf("e.g. 10660=106.60MHz  8800=88.00MHz  1044=104.40MHz\n\n");
 
