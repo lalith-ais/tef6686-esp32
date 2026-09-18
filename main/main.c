@@ -559,8 +559,8 @@ static esp_err_t tef_init_all(void)
     ret = tef_crystal_init_9216();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "Crystal init failed"); return ret; }
 
-    // APPL_Set_OperationMode(1) = normal operation
-    ret = tef_cmd(TEF_APPL, CMD_SET_OP_MODE, 1, 0, 0, 1);
+    // APPL_Set_OperationMode(0) = normal operation (1 = radio standby, no RF)
+    ret = tef_cmd(TEF_APPL, CMD_SET_OP_MODE, 0, 0, 0, 1);
     if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(200));
 
@@ -619,11 +619,14 @@ int16_t wam  = (int16_t)((buf[6] << 8) | buf[7]);
 int16_t offset = (int16_t)((buf[8] << 8) | buf[9]);
 uint16_t bw  =           ((buf[10] << 8) | buf[11]) / 10;
 
-    // Stereo status
+    // Stereo status — cmd 133 (Get_Signal_Status) returns one 16-bit word:
+    // bit 15 = stereo pilot detected, bit 14 = digital signal (TEF6688/6689 only).
+    // Confirmed against NXP User Manual: I2C example "w 20 85 01 [ r 8000"
+    // ("stereo signal found") -> bit 15 is the MSB of sbuf[0], mask 0x8000.
     uint8_t sbuf[2] = {0};
     bool stereo = false;
     if (tef_read(TEF_FM, CMD_GET_SIGNAL_STATUS, sbuf, 2) == ESP_OK)
-        stereo = ((sbuf[0] << 8 | sbuf[1]) & 0x0100) != 0;  // bit 8 = stereo pilot
+        stereo = ((sbuf[0] << 8 | sbuf[1]) & 0x8000) != 0;  // bit 15 = stereo pilot
 
     printf("[%3d.%02d MHz] RSSI:%+5.1f dBuV | USN:%3d | WAM:%3d | "
            "Offset:%+5.1f kHz | BW:%3d kHz | %s\n",
