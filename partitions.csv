@@ -1,0 +1,10 @@
+# ESP32-S3 16MB flash partition table
+# No OTA — single factory app, maximum app space
+#
+# Flash size: 0x1000000 (16MB)
+# Bootloader: 0x0000 – 0x8FFF (first 36KB, managed by IDF)
+#
+# Name,     Type,  SubType,  Offset,   Size,    Flags
+nvs,        data,  nvs,      0x9000,   0x6000,
+phy_init,   data,  phy,      0xF000,   0x1000,
+factory,    app,   factory,  0x10000,  0xFF0000,
