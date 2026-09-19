@@ -706,9 +706,9 @@ static void input_task(void *arg)
             }
             if (strcasecmp(line, "AM") == 0) {
                 current_band = TEF_AM;
-                current_freq = 999;    // default 999 kHz (MW)
+                current_freq = 693;    // default 693 kHz (MW)
                 tef_tune(current_band, current_freq);
-                printf(">> Switched to AM, tuned to 999 kHz\n");
+                printf(">> Switched to AM, tuned to 693 kHz\n");
                 continue;
             }
 
