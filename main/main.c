@@ -568,8 +568,8 @@ static esp_err_t tef_init_all(void)
     ret = tef_radio_init();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "Radio init failed"); return ret; }
 
-    // De-emphasis 50us (Europe) -- parameter is time constant in us
-    tef_cmd(TEF_FM, CMD_SET_DEEMPHASIS, 50, 0, 0, 1);
+    // De-emphasis 50us (Europe) -- parameter is 0.1us units per manual (500 = 50us)
+    tef_cmd(TEF_FM, CMD_SET_DEEMPHASIS, 500, 0, 0, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Set volume 0dB then unmute
@@ -587,9 +587,9 @@ static esp_err_t tef_init_all(void)
 // ==========================================================================
 static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 {
-    // FM Cmd_Tune_To: p1=4 (preset tune), p2=frequency
-    // Matches devTEF_Radio_Tune_To() in Tuner_Drv_Lithio.cpp (mode 4 for FM)
-    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 4, (int16_t)freq_10khz, 0, 2);
+    // FM Cmd_Tune_To: p1=1 (Preset - tune to new program, short mute)
+    // Manual example: FM_Tune_To(1, 1, 8930) -> Preset tuning to FM 89.3 MHz
+    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 1, (int16_t)freq_10khz, 0, 2);
     if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(50));   // let PLL lock before RDS
     // Cmd_Set_RDS(1,1,0) — must follow every tune per Radio_SetFreq() source
@@ -604,7 +604,7 @@ static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 static void tef_print_quality(uint16_t freq)
 {
     // 14 bytes: [2 status][2 level][2 usn][2 wam][2 offset][2 bw][2 mod]
-    // status word: bit15=busy, bits1:0=boot status (see TEF668x user manual)
+    // status word: bit15=AF_update flag, bits9:0=quality timestamp (see manual 4.1)
     uint8_t buf[14] = {0};
     esp_err_t ret = tef_read(TEF_FM, CMD_GET_QUALITY_STATUS, buf, 14);
     if (ret != ESP_OK) {
