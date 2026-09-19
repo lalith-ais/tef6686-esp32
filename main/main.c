@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>   // strcasecmp
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -524,6 +525,27 @@ static esp_err_t tef_radio_init(void)
 }
 
 // ==========================================================================
+// Enable I2S digital audio output (IIS_SD_1) for external VU meter / DSP tap.
+// AUDIO cmd 22 Set_Dig_IO(signal=33, mode=2/output, format=16/I2S-16bit,
+// operation=256/master - TEF generates BCK+WS, samplerate=4410/44.1kHz).
+// Output source defaults to the audio processor (post volume/mute) already,
+// so no Set_Output_Source call needed unless you want the raw pre-mute feed.
+// ==========================================================================
+static esp_err_t tef_enable_i2s_output(void)
+{
+    // [ w 30 16 01 0021 0002 0010 0100 1136 ] (33,2,16,256,4410)
+    uint8_t dig_io[] = {
+        0x30, 0x16, 0x01,
+        0x00, 0x21,   // signal   = 33  (IIS_SD_1 output)
+        0x00, 0x02,   // mode     = 2   (output)
+        0x00, 0x10,   // format   = 16  (I2S 16-bit)
+        0x01, 0x00,   // operation= 256 (master: TEF drives BCK/WS)
+        0x11, 0x36    // samplerate = 4410 (44.1kHz) -- change to 0x12C0 (4800) for 48kHz
+    };
+    return raw_write(dig_io, sizeof(dig_io));
+}
+
+// ==========================================================================
 // Boot status check
 // ==========================================================================
 static uint16_t tef_get_boot_status(void)
@@ -578,22 +600,28 @@ static esp_err_t tef_init_all(void)
     tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // Enable I2S digital audio out for the reused kitchen-radio VU meter
+    ret = tef_enable_i2s_output();
+    if (ret != ESP_OK) ESP_LOGE(TAG, "I2S output enable failed");
+
     ESP_LOGI(TAG, "Audio: volume=0dB unmuted");
     return ESP_OK;
 }
 
 // ==========================================================================
-// Tune FM: frequency in 10kHz units, mode=4 (normal)
+// Tune FM or AM: Tune_To mode=1 (Preset). Frequency units differ by band:
+// FM = 10kHz steps (9000 = 90.00 MHz), AM = plain kHz (999 = 999 kHz)
 // ==========================================================================
-static esp_err_t tef_tune_fm(uint16_t freq_10khz)
+static esp_err_t tef_tune(uint8_t module, uint16_t freq)
 {
-    // FM Cmd_Tune_To: p1=1 (Preset - tune to new program, short mute)
-    // Manual example: FM_Tune_To(1, 1, 8930) -> Preset tuning to FM 89.3 MHz
-    esp_err_t ret = tef_cmd(TEF_FM, CMD_TUNE_TO, 1, (int16_t)freq_10khz, 0, 2);
+    esp_err_t ret = tef_cmd(module, CMD_TUNE_TO, 1, (int16_t)freq, 0, 2);
     if (ret != ESP_OK) return ret;
     vTaskDelay(pdMS_TO_TICKS(50));   // let PLL lock before RDS
-    // Cmd_Set_RDS(1,1,0) — must follow every tune per Radio_SetFreq() source
-    return tef_cmd(TEF_FM, 81, 1, 1, 0, 3);
+    if (module == TEF_FM) {
+        // Cmd_Set_RDS(1,1,0) — FM only, must follow every tune per Radio_SetFreq()
+        return tef_cmd(TEF_FM, 81, 1, 1, 0, 3);
+    }
+    return ESP_OK;   // AM has no RDS
 }
 
 // ==========================================================================
@@ -601,12 +629,12 @@ static esp_err_t tef_tune_fm(uint16_t freq_10khz)
 // Quality_Status returns 14 bytes: 2 status + 2 level + 2 usn + 2 wam +
 //                                   2 offset + 2 bandwidth + 2 modulation
 // ==========================================================================
-static void tef_print_quality(uint16_t freq)
+static void tef_print_quality(uint8_t module, uint16_t freq)
 {
-    // 14 bytes: [2 status][2 level][2 usn][2 wam][2 offset][2 bw][2 mod]
+    // 14 bytes: [2 status][2 level][2 usn/noise][2 wam/co_channel][2 offset][2 bw][2 mod]
     // status word: bit15=AF_update flag, bits9:0=quality timestamp (see manual 4.1)
     uint8_t buf[14] = {0};
-    esp_err_t ret = tef_read(TEF_FM, CMD_GET_QUALITY_STATUS, buf, 14);
+    esp_err_t ret = tef_read(module, CMD_GET_QUALITY_STATUS, buf, 14);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Quality read failed: %s", esp_err_to_name(ret));
         return;
@@ -619,36 +647,45 @@ static void tef_print_quality(uint16_t freq)
     uint16_t bw  =           ((buf[10] << 8) | buf[11]) / 10;
     uint16_t mod =           ((buf[12] << 8) | buf[13]) / 10;
 
-    // Stereo status — cmd 133 (Get_Signal_Status) returns one 16-bit word:
-    // bit 15 = stereo pilot detected, bit 14 = digital signal (TEF6688/6689 only).
-    // Confirmed against NXP User Manual: I2C example "w 20 85 01 [ r 8000"
-    // ("stereo signal found") -> bit 15 is the MSB of sbuf[0], mask 0x8000.
-    uint8_t sbuf[2] = {0};
     bool stereo = false;
-    if (tef_read(TEF_FM, CMD_GET_SIGNAL_STATUS, sbuf, 2) == ESP_OK)
-        stereo = ((sbuf[0] << 8 | sbuf[1]) & 0x8000) != 0;  // bit 15 = stereo pilot
+    if (module == TEF_FM) {
+        // Stereo status — cmd 133 (Get_Signal_Status), FM only. Bit 15 = stereo pilot.
+        uint8_t sbuf[2] = {0};
+        if (tef_read(TEF_FM, CMD_GET_SIGNAL_STATUS, sbuf, 2) == ESP_OK)
+            stereo = ((sbuf[0] << 8 | sbuf[1]) & 0x8000) != 0;
+    }
 
-    printf("[%3d.%02d MHz] RSSI:%+5.1f dBuV | USN:%3d | WAM:%3d | "
-           "Offset:%+5.1f kHz | BW:%3d kHz | MOD:%3d kHz | %s\n",
-           freq/100, freq%100,
-           rssi/10.0f, usn, wam,
-           offset/10.0f, bw, mod,
-           stereo ? "STEREO" : "mono");
+    if (module == TEF_FM) {
+        printf("[FM %3d.%02d MHz] RSSI:%+5.1f dBuV | USN:%3d | WAM:%3d | "
+               "Offset:%+5.1f kHz | BW:%3d kHz | MOD:%3d kHz | %s\n",
+               freq/100, freq%100,
+               rssi/10.0f, usn, wam,
+               offset/10.0f, bw, mod,
+               stereo ? "STEREO" : "mono");
+    } else {
+        printf("[AM %5d kHz] RSSI:%+5.1f dBuV | Noise:%3d | CoChan:%3d | "
+               "Offset:%+5.1f kHz | BW:%3d kHz | MOD:%3d%%\n",
+               freq,
+               rssi/10.0f, usn, wam,
+               offset/10.0f, bw, mod);
+    }
 }
 
 // ==========================================================================
 // Tasks
 // ==========================================================================
-static uint16_t current_freq = 9000;   // 90.00 MHz
+static uint8_t  current_band = TEF_FM;
+static uint16_t current_freq = 9000;   // 90.00 MHz (FM units); AM units are plain kHz
 
 static void quality_task(void *arg)
 {
     printf("\n=== TEF6686 Test v3.1 (F8605 + 12.000MHz + V102 patch) ===\n");
-    printf("Type frequency in 10kHz units + Enter to retune.\n");
-    printf("e.g. 10660=106.60MHz  8800=88.00MHz  1044=104.40MHz\n\n");
+    printf("Type frequency + Enter to retune. FM = 10kHz units, AM = kHz units.\n");
+    printf("e.g. FM: 10660=106.60MHz  8800=88.00MHz | AM: 999=999kHz  15330=15330kHz\n");
+    printf("Type 'FM' or 'AM' + Enter to switch band.\n\n");
 
     while (1) {
-        tef_print_quality(current_freq);
+        tef_print_quality(current_band, current_freq);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -659,12 +696,34 @@ static void input_task(void *arg)
     while (1) {
         if (fgets(line, sizeof(line), stdin)) {
             line[strcspn(line, "\r\n")] = '\0';
+
+            if (strcasecmp(line, "FM") == 0) {
+                current_band = TEF_FM;
+                current_freq = 9000;   // default 90.00 MHz
+                tef_tune(current_band, current_freq);
+                printf(">> Switched to FM, tuned to 90.00 MHz\n");
+                continue;
+            }
+            if (strcasecmp(line, "AM") == 0) {
+                current_band = TEF_AM;
+                current_freq = 999;    // default 999 kHz (MW)
+                tef_tune(current_band, current_freq);
+                printf(">> Switched to AM, tuned to 999 kHz\n");
+                continue;
+            }
+
             int f = atoi(line);
-            if (f >= 6400 && f <= 10800) {
+            bool valid = (current_band == TEF_FM)
+                             ? (f >= 6400 && f <= 10800)
+                             : (f >= 144  && f <= 27000);   // AM: LW/MW/SW combined range
+
+            if (valid) {
                 current_freq = (uint16_t)f;
-                if (tef_tune_fm(current_freq) == ESP_OK) {
-                    printf(">> Tuned to %d.%02d MHz\n",
-                           current_freq/100, current_freq%100);
+                if (tef_tune(current_band, current_freq) == ESP_OK) {
+                    if (current_band == TEF_FM)
+                        printf(">> Tuned to %d.%02d MHz\n", current_freq/100, current_freq%100);
+                    else
+                        printf(">> Tuned to %d kHz\n", current_freq);
                     vTaskDelay(pdMS_TO_TICKS(300));
                     tef_cmd(TEF_AUDIO, CMD_SET_MUTE, 0, 0, 0, 1);
                 } else {
@@ -672,7 +731,7 @@ static void input_task(void *arg)
                 }
                 vTaskDelay(pdMS_TO_TICKS(400));
             } else if (strlen(line) > 0) {
-                printf(">> Invalid: '%s' (use 6400-10800)\n", line);
+                printf(">> Invalid: '%s' (FM: 6400-10800, AM: 144-27000, or type FM/AM)\n", line);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -716,7 +775,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Init complete");
 
     // Tune to default frequency
-    ESP_ERROR_CHECK(tef_tune_fm(current_freq));
+    ESP_ERROR_CHECK(tef_tune(current_band, current_freq));
     ESP_LOGI(TAG, "Tuned to %d.%02d MHz", current_freq/100, current_freq%100);
     vTaskDelay(pdMS_TO_TICKS(1000));  // wait for PLL lock and stereo detection
 
